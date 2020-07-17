@@ -17,8 +17,10 @@
 package fieldtags
 
 import (
+	"fmt"
 	"go/ast"
 	"reflect"
+	"regexp"
 	"strings"
 
 	"golang.org/x/tools/go/analysis"
@@ -32,9 +34,33 @@ type keyValue struct {
 	value string
 }
 
-type sourcePatterns []keyValue
+func (kv *keyValue) String() string {
+	return fmt.Sprintf(`%s:"%s"`, kv.key, kv.value)
+}
 
-var patterns sourcePatterns = []keyValue{
+type keyValueMatcher struct {
+	re *regexp.Regexp
+}
+
+func newKeyValueMatcher(keyValues *[]keyValue) keyValueMatcher {
+	var b strings.Builder
+	b.WriteString("(")
+	for i, keyValue := range *keyValues {
+		b.WriteString(keyValue.String())
+		if i+1 < len(*keyValues) {
+			b.WriteString("|")
+		}
+	}
+	b.WriteString(")")
+
+	re, err := regexp.Compile(b.String())
+	if err != nil {
+		panic(err)
+	}
+	return keyValueMatcher{re}
+}
+
+var sourcePatterns = []keyValue{
 	{"levee", "source"},
 }
 
@@ -54,12 +80,14 @@ func run(pass *analysis.Pass) (interface{}, error) {
 		(*ast.Field)(nil),
 	}
 
+	matcher := newKeyValueMatcher(&sourcePatterns)
+
 	inspect.Preorder(nodeFilter, func(n ast.Node) {
 		field, ok := n.(*ast.Field)
 		if !ok {
 			return
 		}
-		if patterns.isSource(field) {
+		if matcher.isSource(field) {
 			results = append(results, field)
 			pass.Reportf(field.Pos(), "tagged field")
 		}
@@ -67,44 +95,14 @@ func run(pass *analysis.Pass) (interface{}, error) {
 	return results, nil
 }
 
-func (ps *sourcePatterns) isSource(field *ast.Field) bool {
+func (m *keyValueMatcher) isSource(field *ast.Field) bool {
 	if field.Tag == nil {
 		return false
 	}
-
 	tag := field.Tag.Value
+	return m.matches(tag)
+}
 
-	i := 1 // skip backtick
-	j := 1
-	for j < len(tag) {
-		for j < len(tag) && tag[j] != ':' {
-			j++
-		}
-		key := tag[i:j]
-		if key == "" {
-			return false
-		}
-
-		i = j + 2 // skip colon and opening quote
-		j = i
-		for j < len(tag) && tag[j] != '"' {
-			j++
-		}
-		value := tag[i:j]
-		if value == "" {
-			return false
-		}
-
-		for _, p := range *ps {
-			// value may be a list of comma separated values
-			if p.key == key && strings.Contains(value, p.value) {
-				return true
-			}
-		}
-
-		i = j + 2 // skip closing quote and space
-		j = i
-	}
-
-	return false
+func (m *keyValueMatcher) matches(tag string) bool {
+	return m.re.MatchString(tag)
 }
