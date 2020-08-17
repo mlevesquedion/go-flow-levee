@@ -16,8 +16,9 @@ package core
 
 // Source will be configured to be detected as a source struct, with Source.Data as the source field.
 type Source struct {
-	Data string
-	ID   int
+	Secret string `levee:source`
+	Data   string
+	ID     int
 }
 
 func (s Source) GetID() int {
