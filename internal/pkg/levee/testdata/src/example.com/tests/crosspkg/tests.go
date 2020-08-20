@@ -12,29 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package propagation
+package crosspkg
 
 import (
-	"fmt"
-
 	"example.com/core"
+	"example.com/tests/crossfunc"
 )
 
-func Identity(arg interface{}) interface{} {
-	return arg
-}
-
-func TestIdentityPropagator(s core.Source) {
-	i := Identity(s)
-	core.Sink(i)           // want "a source has reached a sink"
-	core.Sink(Identity(s)) // want "a source has reached a sink"
-}
-
-func ToString(arg interface{}) string {
-	return fmt.Sprintf("%v", arg)
-}
-
-func TestToStringPropagator(s core.Source) {
-	v := ToString(s)
-	core.Sink(v) // want "a source has reached a sink"
+func TestCrossPackageSinkWrapper(s core.Source) {
+	crossfunc.SinkWrapper(s) // want "a source has reached a sink, sink:"
 }
