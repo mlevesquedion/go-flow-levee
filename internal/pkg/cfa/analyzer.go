@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/google/go-flow-levee/internal/pkg/utils"
+
 	"github.com/google/go-flow-levee/internal/pkg/config"
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/passes/buildssa"
@@ -31,8 +33,8 @@ type Function interface {
 	// Does this function sink its nth argument?
 	Sinks(arg int) bool
 
-	// If these arguments are tainted, which return values are tainted?
-	Taints(args ...int) []int
+	// If this argument is tainted, which return values are tainted?
+	Taints(arg int) []int
 }
 
 type sink struct{}
@@ -41,7 +43,7 @@ func (s sink) Sinks(arg int) bool {
 	return true
 }
 
-func (s sink) Taints(args ...int) (tainted []int) {
+func (s sink) Taints(arg int) (tainted []int) {
 	return
 }
 
@@ -55,7 +57,7 @@ func (s sanitizer) Sinks(arg int) bool {
 	return false
 }
 
-func (s sanitizer) Taints(args ...int) (tainted []int) {
+func (s sanitizer) Taints(arg int) (tainted []int) {
 	return
 }
 
@@ -64,34 +66,32 @@ func (s sanitizer) String() string {
 }
 
 type genericFunc struct {
-	sinks  []bool
-	taints map[int][]int
+	sinks   []bool
+	taints  [][]int
+	params  int
+	retvals int
 }
 
 func newGenericFunc(f *ssa.Function) genericFunc {
 	params := f.Signature.Params().Len()
 	return genericFunc{
 		sinks:  make([]bool, params),
-		taints: map[int][]int{},
+		taints: make([][]int, params),
+		params: params,
 	}
 }
 
 func (g genericFunc) Sinks(arg int) bool {
+	// TODO: error if out of bounds?
 	return arg < len(g.sinks) && g.sinks[arg]
 }
 
-func (g genericFunc) Taints(args ...int) []int {
-	union := map[int]bool{}
-	for _, a := range args {
-		for _, t := range g.taints[a] {
-			union[t] = true
-		}
+func (g genericFunc) Taints(arg int) (tainted []int) {
+	// TODO: error if out of bounds?
+	if arg >= len(g.sinks) {
+		return nil
 	}
-	var tainted []int
-	for a := range union {
-		tainted = append(tainted, a)
-	}
-	return tainted
+	return g.taints[arg]
 }
 
 func (g genericFunc) String() string {
@@ -100,7 +100,7 @@ func (g genericFunc) String() string {
 	for i, reachesSink := range g.sinks {
 		if reachesSink {
 			b.WriteString(strconv.Itoa(i))
-			if i < len(g.sinks)-1 {
+			if i < len(g.sinks)-2 {
 				b.WriteByte(' ')
 			}
 		}
@@ -109,6 +109,14 @@ func (g genericFunc) String() string {
 	b.WriteString(fmt.Sprintf("%v", g.taints))
 	b.WriteString(" }")
 	return b.String()
+}
+
+func (g genericFunc) Params() int {
+	return g.params
+}
+
+func (g genericFunc) Retvals() int {
+	return g.retvals
 }
 
 type funcFact struct {
@@ -196,7 +204,8 @@ func analyze(pass *analysis.Pass, conf *config.Config, fn *ssa.Function) {
 func analyzeGenericFunc(p *analysis.Pass, c *config.Config, f *ssa.Function) genericFunc {
 	gf := newGenericFunc(f)
 
-	retVals := findRetvals(f)
+	retVals, count := findRetvals(f)
+	gf.retvals = count
 
 	for i, param := range f.Params {
 		reachesSink, taints := visit(p, c, retVals, param)
@@ -211,7 +220,150 @@ func analyzeGenericFunc(p *analysis.Pass, c *config.Config, f *ssa.Function) gen
 	return gf
 }
 
-func findRetvals(f *ssa.Function) map[ssa.Value]int {
+type visitor struct {
+	pass        *analysis.Pass
+	conf        *config.Config
+	retVals     map[ssa.Value]int
+	visited     map[ssa.Node]bool
+	reachesSink bool
+	taints      []int
+}
+
+func visit(p *analysis.Pass, conf *config.Config, retVals map[ssa.Value]int, param *ssa.Parameter) (reachesSink bool, taints []int) {
+	v := visitor{
+		pass:    p,
+		conf:    conf,
+		retVals: retVals,
+		visited: map[ssa.Node]bool{},
+	}
+
+	v.dfs(param)
+
+	return v.reachesSink, v.taints
+}
+
+func (v *visitor) dfs(n ssa.Node) {
+	if v.visited[n] {
+		return
+	}
+	v.visited[n] = true
+
+	// might not need this at all? return instructions are a thing? as in they return values?
+	// note to self: visualize ssa graph more often
+	if val, ok := n.(ssa.Value); ok {
+		if i, isRet := v.retVals[val]; isRet {
+			v.taints = append(v.taints, i)
+		}
+	}
+
+	if _, ok := n.(*ssa.Return); ok {
+		return
+	}
+
+	if call, ok := n.(*ssa.Call); ok {
+		if call.Call.IsInvoke() {
+			return
+		}
+		f, _ := call.Call.Value.(*ssa.Function)
+		fact := &funcFact{}
+		hasFact := v.pass.ImportObjectFact(f.Object(), fact)
+		if !hasFact {
+			analyze(v.pass, v.conf, f)
+		}
+		hasFactNow := v.pass.ImportObjectFact(f.Object(), fact)
+		if !hasFactNow {
+			panic("ʕノ◔ϖ◔ʔノ彡┻━┻")
+		}
+
+		switch ff := fact.Function.(type) {
+		case sink:
+			v.reachesSink = true
+			// value has reached a sink, stop traversing
+			return
+		case sanitizer:
+			// value has been sanitized, stop traversing
+			return
+		case genericFunc:
+			// if func has multiple retvals, will have an extract
+			// otherwise func itself is a value so dfsing through it = dfsing through its retval,
+			// just don't dfs through its arguments
+			switch ff.Retvals() {
+			case 0:
+				// TODO: validate this
+				// function has no return value, so nowhere to traverse to
+				return
+
+			case 1:
+				for i, a := range call.Call.Args {
+					if v.visited[a.(ssa.Node)] {
+						v.reachesSink = v.reachesSink && ff.Sinks(i)
+						argTaints := ff.Taints(i)
+						if len(argTaints) == 0 {
+							// this arg does not taint the return values
+							continue
+						}
+						// since this function has only 1 return value, we know it is tainted
+						break
+						// break so we'll hit the operands/referrers instructions later
+					}
+				}
+
+			// >=2 retvals
+			default:
+				extractMap := map[int]*ssa.Extract{}
+				for _, r := range *call.Referrers() {
+					if e, ok := r.(*ssa.Extract); ok {
+						extractMap[e.Index] = e
+					}
+				}
+				extracts := make([]*ssa.Extract, len(extractMap))
+				for i, e := range extractMap {
+					extracts[i] = e
+				}
+				taintUnion := map[int]bool{}
+				for i, a := range call.Call.Args {
+					if v.visited[a.(ssa.Node)] {
+						v.reachesSink = v.reachesSink && ff.Sinks(i)
+						for _, j := range ff.Taints(i) {
+							taintUnion[j] = true
+						}
+					}
+				}
+				for i := range taintUnion {
+					v.dfs(extracts[i])
+				}
+				return
+			}
+		}
+	}
+
+	referrers := n.Referrers()
+	if referrers != nil {
+		for _, r := range *referrers {
+			n := r.(ssa.Node)
+			v.dfs(n)
+		}
+	}
+
+	var operands []*ssa.Value
+	operands = n.Operands(operands)
+	if operands != nil {
+		for _, o := range operands {
+			n, ok := (*o).(ssa.Node)
+			if !ok {
+				continue
+			}
+			if al, isAlloc := (*o).(*ssa.Alloc); isAlloc {
+				if _, isArray := utils.Dereference(al.Type()).(*types.Array); !isArray {
+					return
+				}
+			}
+			v.dfs(n)
+		}
+	}
+}
+
+func findRetvals(f *ssa.Function) (valToPos map[ssa.Value]int, count int) {
 	retvals := map[ssa.Value]int{}
 	for _, b := range f.Blocks {
 		if len(b.Instrs) == 0 {
@@ -225,84 +377,7 @@ func findRetvals(f *ssa.Function) map[ssa.Value]int {
 		for i, res := range ret.Results {
 			retvals[res] = i
 		}
+		count = len(ret.Results)
 	}
-	return retvals
-}
-
-func visit(p *analysis.Pass, conf *config.Config, retVals map[ssa.Value]int, param *ssa.Parameter) (reachesSink bool, taints []int) {
-	// TODO: figure out a way to not use interface{}
-	visited := map[interface{}]bool{}
-	stack := []interface{}{param}
-
-	for len(stack) > 0 {
-		current := stack[len(stack)-1]
-		stack = stack[:len(stack)-1]
-
-		switch t := current.(type) {
-		case *ssa.Value:
-			i, isRet := retVals[*t]
-			if isRet {
-				taints = append(taints, i)
-			}
-
-		case *ssa.Call:
-			// TODO: handle methods
-			if t.Call.IsInvoke() {
-				continue
-			}
-			f, _ := t.Call.Value.(*ssa.Function)
-			fact := &funcFact{}
-			hasFact := p.ImportObjectFact(f.Object(), fact)
-			if !hasFact {
-				analyze(p, conf, f)
-			}
-			hasFactNow := p.ImportObjectFact(f.Object(), fact)
-			if !hasFactNow {
-				panic("ʕノ◔ϖ◔ʔノ彡┻━┻")
-			}
-
-			switch ff := fact.Function.(type) {
-			case sink:
-				reachesSink = true
-			case sanitizer:
-			// stop visiting
-			case genericFunc:
-				// if func has multiple retvals, will have an extract
-				// otherwise func itself is a value so dfsing through it = dfsing through its retval,
-				// just don't dfs through its arguments
-				switch len(retVals) {
-				case 0:
-				// stop
-				case 1:
-					// dfs through
-					for i, a := range t.Call.Args {
-						if visited[a] {
-							reachesSink = reachesSink && ff.Sinks(i)
-							argTaints := ff.Taints(i)
-							if len(argTaints) == 0 {
-								// stop visiting
-							}
-
-						}
-					}
-				default:
-					// dfs through
-					for i, a := range t.Call.Args {
-						if visited[a] {
-							reachesSink = reachesSink && ff.Sinks(i)
-							argTaints := ff.Taints(i)
-							if len(argTaints) == 0 {
-								// stop visiting
-							}
-							// search for Extracts in Referrers and dfs through them if they receive a tainted argument
-						}
-					}
-				}
-				// only need to visit tainted return values
-			}
-		}
-	}
-	// when you visit a value, check whether it is a return value, if so add its index to the slice of taints
-
-	return reachesSink, taints
+	return retvals, count
 }

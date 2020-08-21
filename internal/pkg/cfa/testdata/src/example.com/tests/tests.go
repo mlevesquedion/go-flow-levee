@@ -1,9 +1,11 @@
-package main
+package tests
 
 import "example.com/core"
 
-func SinkWrapper(a interface{}, b interface{}) (interface{}, interface{}) { // want SinkWrapper:"genericFunc{ sinks: [0], taints: map[0:[] 1:[0]] }"
+// this regex matching in wants can be a bit of a pain sometimes...
+func SinkWrapper(a interface{}, b interface{}) (interface{}, interface{}) { // want SinkWrapper:"genericFunc{ sinks: \\[0\\], taints: \\[\\[\\] \\[0\\]\\] }"
 	core.Sink(a)
 	sanitized := core.Sanitize(a)
-	return b, sanitized
+	tainted := []interface{}{b}
+	return tainted, sanitized
 }

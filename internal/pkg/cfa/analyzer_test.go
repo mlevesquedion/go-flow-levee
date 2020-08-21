@@ -15,17 +15,24 @@
 package cfa
 
 import (
+	"flag"
 	"path/filepath"
 	"testing"
 
 	"github.com/google/go-flow-levee/internal/pkg/config"
+	"github.com/google/go-flow-levee/internal/pkg/debug"
 	"golang.org/x/tools/go/analysis/analysistest"
 )
+
+var debugging *bool = flag.Bool("debug", false, "run the debug analyzer")
 
 func TestFieldPropagatorAnalysis(t *testing.T) {
 	testdata := analysistest.TestData()
 	if err := config.FlagSet.Set("config", filepath.Join(testdata, "test-config.json")); err != nil {
 		t.Error(err)
+	}
+	if *debugging {
+		Analyzer.Requires = append(Analyzer.Requires, debug.Analyzer)
 	}
 	analysistest.Run(t, testdata, Analyzer, "example.com/core", "example.com/tests")
 }
