@@ -9,3 +9,7 @@ func SinkWrapper(a interface{}, b interface{}) (interface{}, interface{}) { // w
 	tainted := []interface{}{b}
 	return tainted, sanitized
 }
+
+func SinkWrapperWrapper(e interface{}) { // want SinkWrapperWrapper:"genericFunc{ sinks: \\[0\\], taints: \\[\\[\\]\\] }"
+	SinkWrapper(e, "whatever")
+}

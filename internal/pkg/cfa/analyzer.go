@@ -323,11 +323,15 @@ func (v *visitor) dfs(n ssa.Node) {
 				taintUnion := map[int]bool{}
 				for i, a := range call.Call.Args {
 					if v.visited[a.(ssa.Node)] {
-						v.reachesSink = v.reachesSink && ff.Sinks(i)
+						v.reachesSink = v.reachesSink || ff.Sinks(i)
 						for _, j := range ff.Taints(i) {
 							taintUnion[j] = true
 						}
 					}
+				}
+				// function has >= 2 return values, but they are "swallowed"
+				if len(extracts) == 0 {
+					return
 				}
 				for i := range taintUnion {
 					v.dfs(extracts[i])
