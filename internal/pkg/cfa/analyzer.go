@@ -15,6 +15,7 @@
 package cfa
 
 import (
+	"fmt"
 	"go/types"
 	"reflect"
 	"strings"
@@ -51,16 +52,17 @@ var Analyzer = &analysis.Analyzer{
 
 var pkgDenylist = []string{
 	"atomic",
-	"race",
 	"bytealg",
-	"internal",
-	"sync",
-	"runtime",
-	"unsafe",
 	"cpu",
-	"sys",
+	"internal",
+	"math",
+	"race",
 	"reflect",
 	"reflectlite",
+	"runtime",
+	"sync",
+	"sys",
+	"unsafe",
 }
 
 func run(pass *analysis.Pass) (interface{}, error) {
@@ -79,6 +81,9 @@ func run(pass *analysis.Pass) (interface{}, error) {
 	}
 
 	for _, fn := range ssaInput.SrcFuncs {
+		if strings.Contains(fn.Name(), "OneParamSinkWrapper") {
+			fmt.Println("hey")
+		}
 		analyze(pass, conf, fn)
 	}
 
@@ -97,7 +102,7 @@ func analyze(pass *analysis.Pass, conf *config.Config, fn *ssa.Function) {
 	if fn.Signature.Recv() != nil {
 		return
 	}
-	// this function is in a denylisted packaged; exporting a fact on another package's objects is an error
+	// this function is in a denylisted package; exporting a fact on another package's objects is an error
 	// some functions do not have objects
 	if fn.Pkg.Pkg != pass.Pkg || fn.Object() == nil {
 		return
@@ -167,36 +172,44 @@ func (v *visitor) dfs(n ssa.Node) {
 		for _, i := range v.valTaints[n] {
 			v.taints = append(v.taints, i)
 		}
-	case *ssa.Call:
-		// method call
-		if n.Call.IsInvoke() {
-			return
-		}
+	}
 
-		f, ok := n.Call.Value.(*ssa.Function)
-		if !ok {
-			// assume we should keep traversing
-			break
-		}
-
-		fact := &funcFact{}
-		hasFact := v.pass.ImportObjectFact(f.Object(), fact)
-		if !hasFact {
-			analyze(v.pass, v.conf, f)
-		}
-		hasFactNow := v.pass.ImportObjectFact(f.Object(), fact)
-		if !hasFactNow {
-			// this should only happen if the function being visited is in a denylisted package
-			// assume we should keep traversing
-			break
-		}
-
-		v.visitFunc(n, fact)
+	call, ok := n.(*ssa.Call)
+	if !ok {
+		v.visitReferrers(n)
+		v.visitOperands(n)
 		return
 	}
 
-	v.visitReferrers(n)
-	v.visitOperands(n)
+	// method call
+	if call.Call.IsInvoke() {
+		return
+	}
+
+	f, ok := call.Call.Value.(*ssa.Function)
+	if !ok {
+		// assume we should keep traversing
+		v.visitReferrers(n)
+		v.visitOperands(n)
+		return
+	}
+
+	fact := &funcFact{}
+	hasFact := v.pass.ImportObjectFact(f.Object(), fact)
+	if !hasFact {
+		analyze(v.pass, v.conf, f)
+	}
+	hasFactNow := v.pass.ImportObjectFact(f.Object(), fact)
+	if !hasFactNow {
+		// this should only happen if the function being visited is in a denylisted package
+		// assume we should keep traversing
+		v.visitReferrers(n)
+		v.visitOperands(n)
+		return
+	}
+
+	v.visitFunc(call, fact)
+	return
 }
 
 func (v *visitor) visitFunc(n *ssa.Call, fact *funcFact) {
