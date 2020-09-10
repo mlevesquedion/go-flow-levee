@@ -10,7 +10,7 @@ type iscsiMounter struct {
 	secret map[string]string
 }
 
-func AttachDisk(b iscsiMounter) error { // want AttachDisk:"genericFunc{ sinks: <0>, taints: <<>> }"
+func AttachDisk(b iscsiMounter) { // want AttachDisk:"genericFunc{ sinks: <0>, taints: <<>> }"
 	if err := updateISCSINode(b); err != nil {
 		core.Sinkf("iscsi error:\n%v", err)
 	}

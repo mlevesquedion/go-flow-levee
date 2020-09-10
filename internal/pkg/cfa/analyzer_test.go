@@ -34,7 +34,7 @@ func TestAnalyzer(t *testing.T) {
 	if *debugging {
 		Analyzer.Requires = append(Analyzer.Requires, debug.Analyzer)
 	}
-	for _, pkg := range []string{"cfa", "core", "crosspkg"} {
+	for _, pkg := range []string{"cfa", "core", "crosspkg", "iscsi"} {
 		analysistest.Run(t, testdata, Analyzer, filepath.Join("example.com", pkg))
 	}
 }

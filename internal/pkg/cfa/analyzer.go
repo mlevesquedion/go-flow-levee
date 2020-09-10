@@ -18,8 +18,6 @@ import (
 	"go/types"
 	"reflect"
 
-	"github.com/google/go-flow-levee/internal/pkg/utils"
-
 	"github.com/google/go-flow-levee/internal/pkg/config"
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/passes/buildssa"
@@ -245,11 +243,6 @@ func (v *visitor) visitOperands(n ssa.Node) {
 			n, ok := (*o).(ssa.Node)
 			if !ok {
 				continue
-			}
-			if al, isAlloc := (*o).(*ssa.Alloc); isAlloc {
-				if _, isArray := utils.Dereference(al.Type()).(*types.Array); !isArray {
-					return
-				}
 			}
 			v.dfs(n)
 		}
