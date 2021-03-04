@@ -22,6 +22,7 @@ import (
 
 	"github.com/google/go-flow-levee/internal/pkg/config"
 	"github.com/google/go-flow-levee/internal/pkg/fieldtags"
+	"github.com/google/go-flow-levee/internal/pkg/interproc"
 	"github.com/google/go-flow-levee/internal/pkg/propagation"
 	"github.com/google/go-flow-levee/internal/pkg/utils"
 	"golang.org/x/tools/go/analysis"
@@ -53,12 +54,13 @@ var Analyzer = &analysis.Analyzer{
 A field propagator is a function that returns a value that is tainted by a source field.`,
 	Flags:      config.FlagSet,
 	Run:        run,
-	Requires:   []*analysis.Analyzer{buildssa.Analyzer, fieldtags.Analyzer},
+	Requires:   []*analysis.Analyzer{interproc.Analyzer, buildssa.Analyzer, fieldtags.Analyzer},
 	ResultType: reflect.TypeOf(new(ResultType)).Elem(),
 	FactTypes:  []analysis.Fact{new(isFieldPropagator)},
 }
 
 func run(pass *analysis.Pass) (interface{}, error) {
+	funcSummaries := pass.ResultOf[interproc.Analyzer].(interproc.ResultType)
 	taggedFields := pass.ResultOf[fieldtags.Analyzer].(fieldtags.ResultType)
 	ssaInput := pass.ResultOf[buildssa.Analyzer].(*buildssa.SSA)
 
@@ -74,7 +76,7 @@ func run(pass *analysis.Pass) (interface{}, error) {
 			continue
 		}
 		for _, meth := range methods(ssaProg, ssaType.Type()) {
-			analyzeBlocks(pass, conf, taggedFields, meth)
+			analyzeBlocks(pass, conf, funcSummaries, taggedFields, meth)
 		}
 	}
 
@@ -105,7 +107,7 @@ func methodValues(ssaProg *ssa.Program, t types.Type) []*ssa.Function {
 	return methodValues
 }
 
-func analyzeBlocks(pass *analysis.Pass, conf *config.Config, tf fieldtags.ResultType, meth *ssa.Function) {
+func analyzeBlocks(pass *analysis.Pass, conf *config.Config, funcSummaries interproc.ResultType, tf fieldtags.ResultType, meth *ssa.Function) {
 	var propagations []propagation.Propagation
 
 	for _, b := range meth.Blocks {
@@ -125,7 +127,7 @@ func analyzeBlocks(pass *analysis.Pass, conf *config.Config, tf fieldtags.Result
 				continue
 			}
 			if conf.IsSourceField(utils.DecomposeField(txType, field)) || tf.IsSourceField(txType, field) {
-				propagations = append(propagations, propagation.Taint(instr.(ssa.Node), conf, tf))
+				propagations = append(propagations, propagation.Taint(instr.(ssa.Node), conf, tf, funcSummaries))
 			}
 		}
 	}

@@ -1,0 +1,11 @@
+---
+Sources:
+  - Package: "interproc_analysistest/example.com/core"
+    Type: "Source"
+    FieldRE: "^Data"
+Sinks:
+  - Package: "interproc_analysistest/example.com/core"
+    MethodRE: "Sinkf?$"
+Sanitizers:
+  - Package: "interproc_analysistest/example.com/core"
+    MethodRE: "^Sanitize"

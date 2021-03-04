@@ -12,47 +12,189 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package propagation implements the core taint propagation analysis that
-// can be used to determine what ssa Nodes are tainted if a given Node is a source.
-package propagation
+// Package interproc implements interprocedural taint propagation analysis
+// using function summaries. A summary of each function's behavior is created,
+// such that a function can be queried about what happens if each of its arguments
+// is tainted. Specifically:
+// * Which (if any) return values are tainted?
+// * Does taint reach a sink?
+package interproc
 
 import (
 	"fmt"
 	"go/types"
 	"log"
+	"reflect"
+	"sort"
 
 	"github.com/google/go-flow-levee/internal/pkg/config"
 	"github.com/google/go-flow-levee/internal/pkg/fieldtags"
-	"github.com/google/go-flow-levee/internal/pkg/interproc"
 	"github.com/google/go-flow-levee/internal/pkg/sanitizer"
 	"github.com/google/go-flow-levee/internal/pkg/sourcetype"
 	"github.com/google/go-flow-levee/internal/pkg/utils"
+	"golang.org/x/tools/go/analysis"
+	"golang.org/x/tools/go/analysis/passes/buildssa"
 	"golang.org/x/tools/go/pointer"
 	"golang.org/x/tools/go/ssa"
 )
 
+// ResultType is a mapping from types.Object to cfa.Function
+type ResultType = map[types.Object]Function
+
+type funcFact struct {
+	F Function
+}
+
+func (ff funcFact) AFact() {}
+
+func (ff funcFact) String() string {
+	return ff.F.String()
+}
+
+// Dirty hack: this is just so we can force the analysis package to gob.Register
+// this type.
+func (gf genericFunc) AFact() {}
+
+// Dirty hack: this is just so we can force the analysis package to gob.Register
+// this type.
+func (s sink) AFact() {}
+
+// Dirty hack: this is just so we can force the analysis package to gob.Register
+// this type.
+func (s sanit) AFact() {}
+
+var Analyzer = &analysis.Analyzer{
+	Name:       "interproc",
+	Run:        run,
+	Flags:      config.FlagSet,
+	Doc:        "interproc",
+	Requires:   []*analysis.Analyzer{buildssa.Analyzer, fieldtags.Analyzer},
+	ResultType: reflect.TypeOf(new(ResultType)).Elem(),
+	// Dirty hack: genericFunc, sink and sanit aren't actually facts, this is just
+	// to force the analysis package to gob.Register them
+	FactTypes: []analysis.Fact{new(funcFact), new(genericFunc), new(sink), new(sanit)},
+}
+
+func run(pass *analysis.Pass) (interface{}, error) {
+	ssaInput := pass.ResultOf[buildssa.Analyzer].(*buildssa.SSA)
+	taggedFields := pass.ResultOf[fieldtags.Analyzer].(fieldtags.ResultType)
+	conf, err := config.ReadConfig()
+	if err != nil {
+		return nil, err
+	}
+
+	var funcsToAnalyze []*ssa.Function
+	for _, fn := range ssaInput.SrcFuncs {
+		switch {
+		case conf.IsSink(utils.DecomposeFunction(fn)) && pass.Pkg == fn.Pkg.Pkg:
+			pass.ExportObjectFact(fn.Object(), &funcFact{sink{}})
+		case conf.IsSanitizer(utils.DecomposeFunction(fn)) && pass.Pkg == fn.Pkg.Pkg:
+			pass.ExportObjectFact(fn.Object(), &funcFact{sanit{}})
+		default:
+			funcsToAnalyze = append(funcsToAnalyze, fn)
+		}
+	}
+
+	analyzing := map[*ssa.Function]bool{}
+	for _, fn := range funcsToAnalyze {
+		analyze(pass, conf, taggedFields, analyzing, fn)
+	}
+
+	functions := map[types.Object]Function{}
+	for _, f := range pass.AllObjectFacts() {
+		ff, _ := f.Fact.(*funcFact)
+		functions[f.Object] = ff.F
+	}
+	return functions, nil
+}
+
+func analyze(pass *analysis.Pass, conf *config.Config, taggedFields fieldtags.ResultType, analyzing map[*ssa.Function]bool, fn *ssa.Function) {
+	// this function is part of a cycle
+	if analyzing[fn] {
+		return
+	}
+
+	// TODO: pretty sure we don't need to skip methods
+	//if fn.Signature.Recv() != nil {
+	//	return
+	//}
+
+	// some functions do not have objects, so they can't be analyzed
+	// e.g. exporting a fact on a nil object is an error
+	if fn.Object() == nil {
+		return
+	}
+
+	// fn.Pkg is nil for shared funcs (according to docs for ssa.Function.Pkg)
+	if fn.Pkg == nil || pass.Pkg != fn.Pkg.Pkg {
+		return
+	}
+
+	analyzing[fn] = true
+	gf := analyzeGenericFunc(pass, conf, taggedFields, analyzing, fn)
+	pass.ExportObjectFact(fn.Object(), &funcFact{gf})
+	analyzing[fn] = false
+}
+
+func analyzeGenericFunc(pass *analysis.Pass, conf *config.Config, taggedFields fieldtags.ResultType, analyzing map[*ssa.Function]bool, f *ssa.Function) genericFunc {
+	gf := newGenericFunc(f)
+
+	for i, param := range f.Params {
+		prop := Taint(param, analyzing, pass, conf, taggedFields)
+
+		gf.Sinks_[i] = prop.reachesSink
+
+		// which return values are tainted by param i?
+		// (a retval is considered tainted if it is tainted in at least one return)
+		taintedRetval := map[int]bool{}
+		for node := range prop.tainted {
+			// TODO: prop.IsTainted on Return is an underapproximation, but we can't
+			// check for sanitization status on the returned values because they are
+			// values (checking sanitization status requires an instruction, because
+			// it relies on domination)
+			if r, ok := node.(*ssa.Return); ok && prop.IsTainted(r) {
+				for i, res := range r.Results {
+					if prop.tainted[res.(ssa.Node)] {
+						taintedRetval[i] = true
+					}
+				}
+			}
+		}
+		taints := make([]int, 0, len(taintedRetval))
+		for i := range taintedRetval {
+			taints = append(taints, i)
+		}
+		sort.Ints(taints)
+		gf.Taints_[i] = taints
+	}
+
+	return gf
+}
+
 // Propagation represents the information that is used by, and collected
 // during, a taint propagation analysis.
 type Propagation struct {
-	root          ssa.Node
-	tainted       map[ssa.Node]bool
-	preOrder      []ssa.Node
-	sanitizers    []*sanitizer.Sanitizer
-	ReachedSinks  []*ssa.Call
-	config        *config.Config
-	taggedFields  fieldtags.ResultType
-	funcSummaries interproc.ResultType
+	root         ssa.Node
+	tainted      map[ssa.Node]bool
+	preOrder     []ssa.Node
+	reachesSink  bool
+	sanitizers   []*sanitizer.Sanitizer
+	analyzing    map[*ssa.Function]bool
+	pass         *analysis.Pass
+	conf         *config.Config
+	taggedFields fieldtags.ResultType
 }
 
 // Taint performs a depth-first search of the graph formed by SSA Referrers and
 // Operands relationships, beginning at the given root node.
-func Taint(n ssa.Node, conf *config.Config, taggedFields fieldtags.ResultType, funcSummaries interproc.ResultType) Propagation {
+func Taint(n ssa.Node, analyzing map[*ssa.Function]bool, pass *analysis.Pass, conf *config.Config, taggedFields fieldtags.ResultType) Propagation {
 	prop := Propagation{
-		root:          n,
-		tainted:       make(map[ssa.Node]bool),
-		config:        conf,
-		taggedFields:  taggedFields,
-		funcSummaries: funcSummaries,
+		root:         n,
+		tainted:      make(map[ssa.Node]bool),
+		analyzing:    analyzing,
+		pass:         pass,
+		conf:         conf,
+		taggedFields: taggedFields,
 	}
 	maxInstrReached := map[*ssa.BasicBlock]int{}
 
@@ -221,7 +363,7 @@ func (prop *Propagation) taintNeighbors(n ssa.Node, maxInstrReached map[*ssa.Bas
 }
 
 func (prop *Propagation) taintField(n ssa.Node, maxInstrReached map[*ssa.BasicBlock]int, lastBlockVisited *ssa.BasicBlock, t types.Type, field int) {
-	if !prop.config.IsSourceField(utils.DecomposeField(t, field)) && !prop.taggedFields.IsSourceField(t, field) {
+	if !prop.conf.IsSourceField(utils.DecomposeField(t, field)) && !prop.taggedFields.IsSourceField(t, field) {
 		return
 	}
 	prop.taintReferrers(n, maxInstrReached, lastBlockVisited)
@@ -253,14 +395,14 @@ func (prop *Propagation) taintCall(call *ssa.Call, maxInstrReached map[*ssa.Basi
 		return
 	}
 
-	if callee := call.Call.StaticCallee(); callee != nil && prop.config.IsSanitizer(utils.DecomposeFunction(callee)) {
+	if callee := call.Call.StaticCallee(); callee != nil && prop.conf.IsSanitizer(utils.DecomposeFunction(callee)) {
 		prop.sanitizers = append(prop.sanitizers, &sanitizer.Sanitizer{Call: call})
 	}
 
 	// Do not traverse through a method call if it is being reached via a Source receiver.
 	// Do traverse if the call is being reached through a tainted argument.
 	// Source methods that return tainted values regardless of their arguments should be identified by the fieldpropagator analyzer.
-	if recv := call.Call.Signature().Recv(); recv != nil && sourcetype.IsSourceType(prop.config, prop.taggedFields, recv.Type()) {
+	if recv := call.Call.Signature().Recv(); recv != nil && sourcetype.IsSourceType(prop.conf, prop.taggedFields, recv.Type()) {
 		// If the receiver is not statically known (it has interface type) and the
 		// method has no arguments, Args will be empty.
 		if len(call.Call.Args) == 0 {
@@ -284,33 +426,48 @@ func (prop *Propagation) taintCall(call *ssa.Call, maxInstrReached map[*ssa.Basi
 		}
 	}
 
-	// TODO: this is a pretty big underapproximation, but may be pragmatic
-	if call.Call.StaticCallee() == nil {
+	f := call.Call.StaticCallee()
+
+	// TODO: Assume non-static calls are safe.
+	//       This is a pretty big underapproximation, but may be pragmatic.
+	//       In future, we will likely want to identify candidate callees,
+	//       analyze all of them, and take the union as summary.
+	if f == nil || f.Object() == nil {
 		return
 	}
 
-	f, ok := call.Call.Value.(*ssa.Function)
-	if !ok || f.Object() == nil {
+	fact := &funcFact{}
+	hasFact := prop.pass.ImportObjectFact(f.Object(), fact)
+	if !hasFact {
+		analyze(prop.pass, prop.conf, prop.taggedFields, prop.analyzing, f)
+	}
+
+	hasFactNow := prop.pass.ImportObjectFact(f.Object(), fact)
+	// the function being called is part of a cycle in the call graph
+	// assume we should keep traversing
+	// (this overapproximates)
+	if !hasFactNow {
+		prop.taintReferrers(call, maxInstrReached, lastBlockVisited)
 		return
 	}
 
-	summary, ok := prop.funcSummaries[f.Object()]
-	if !ok {
-		return
-	}
-	for i, a := range call.Call.Args {
-		if prop.tainted[a.(ssa.Node)] && summary.Sinks(i) {
-			prop.ReachedSinks = append(prop.ReachedSinks, call)
-		}
-	}
+	funcSummary := fact.F
 
-	// TODO: the below was copied from the interproc analyzer
-
+	// find answers to:
+	//   - have we reached a sink?
+	//   - which return values are tainted, given the taint status of the args?
+	// TODO: This underapproximates, because a call won't be visited twice, but
+	//       a call may be reached through more than one taint propagation path,
+	//       so we should actually avoid analyzing a call until we have determined
+	//       the taint status of all of its arguments.
+	// TODO: I'm pretty sure the way this identifies extracts to traverse to could
+	//       be simplified.
 	taintedRetvals := map[int]bool{}
 	for i, a := range call.Call.Args {
 		// if we've visited this argument, then we are on a path from the current parameter to this call
 		if prop.tainted[a.(ssa.Node)] {
-			for _, j := range summary.Taints(i) {
+			prop.reachesSink = prop.reachesSink || funcSummary.Sinks(i)
+			for _, j := range funcSummary.Taints(i) {
 				taintedRetvals[j] = true
 			}
 		}
@@ -340,6 +497,20 @@ func (prop *Propagation) taintCall(call *ssa.Call, maxInstrReached map[*ssa.Basi
 			prop.taint(extracts[i], maxInstrReached, lastBlockVisited, true)
 		}
 	}
+
+	// TODO: for now, assume colocated args can't be tainted (underapproximation)
+	// TODO: this can be handled later, i.e. by checking which params are reachable
+	//       from each param
+	//for _, a := range call.Call.Args {
+	//	prop.taintCallArg(a, maxInstrReached, lastBlockVisited)
+	//}
+	//prop.taintOperands(call, maxInstrReached, lastBlockVisited)
+
+	// TODO: exception to the above: we have to assume that the receiver is tainted
+	//       otherwise calls to e.g. fmt.Sprintf won't register
+	//if recv := call.Call.Signature().Recv(); recv != nil {
+	//	prop.taint(call.Call.Args[0].(ssa.Node), maxInstrReached, lastBlockVisited, true)
+	//}
 }
 
 func (prop *Propagation) taintBuiltin(c *ssa.Call, builtinName string, maxInstrReached map[*ssa.BasicBlock]int, lastBlockVisited *ssa.BasicBlock) {

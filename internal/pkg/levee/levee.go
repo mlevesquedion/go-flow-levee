@@ -20,9 +20,9 @@ import (
 
 	"github.com/google/go-flow-levee/internal/pkg/config"
 	"github.com/google/go-flow-levee/internal/pkg/fieldtags"
+	"github.com/google/go-flow-levee/internal/pkg/interproc"
 	"github.com/google/go-flow-levee/internal/pkg/propagation"
 	"github.com/google/go-flow-levee/internal/pkg/source"
-	"github.com/google/go-flow-levee/internal/pkg/utils"
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/ssa"
 )
@@ -32,7 +32,7 @@ var Analyzer = &analysis.Analyzer{
 	Run:      run,
 	Flags:    config.FlagSet,
 	Doc:      "reports attempts to source data to sinks",
-	Requires: []*analysis.Analyzer{source.Analyzer, fieldtags.Analyzer},
+	Requires: []*analysis.Analyzer{interproc.Analyzer, source.Analyzer, fieldtags.Analyzer},
 }
 
 func run(pass *analysis.Pass) (interface{}, error) {
@@ -42,24 +42,33 @@ func run(pass *analysis.Pass) (interface{}, error) {
 	}
 	funcSources := pass.ResultOf[source.Analyzer].(source.ResultType)
 	taggedFields := pass.ResultOf[fieldtags.Analyzer].(fieldtags.ResultType)
+	funcSummaries := pass.ResultOf[interproc.Analyzer].(interproc.ResultType)
+
+	reported := map[ssa.Instruction]bool{}
 
 	for fn, sources := range funcSources {
 		propagations := make(map[*source.Source]propagation.Propagation, len(sources))
 		for _, s := range sources {
-			propagations[s] = propagation.Taint(s.Node, conf, taggedFields)
+			prop := propagation.Taint(s.Node, conf, taggedFields, funcSummaries)
+			propagations[s] = prop
+			for _, sink := range prop.ReachedSinks {
+				// take sanitization into account
+				if !prop.IsTainted(sink) || reported[sink] {
+					continue
+				}
+				reported[sink] = true
+				report(conf, pass, s, sink)
+			}
 		}
 
 		for _, b := range fn.Blocks {
 			for _, instr := range b.Instrs {
-				switch v := instr.(type) {
-				case *ssa.Call:
-					if callee := v.Call.StaticCallee(); callee != nil && conf.IsSink(utils.DecomposeFunction(callee)) {
-						reportSourcesReachingSink(conf, pass, propagations, instr)
-					}
+				switch instr.(type) {
 				case *ssa.Panic:
-					if conf.AllowPanicOnTaintedValues {
+					if conf.AllowPanicOnTaintedValues || reported[instr] {
 						continue
 					}
+					reported[instr] = true
 					reportSourcesReachingSink(conf, pass, propagations, instr)
 				}
 			}
